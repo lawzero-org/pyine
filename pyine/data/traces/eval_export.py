@@ -372,7 +372,7 @@ class CertificationResult:
 
 
 @dataclasses.dataclass(frozen=True)
-class _TraceReference:
+class TraceReference:
     """Lightweight pointer to one selected trace before its full record is loaded."""
 
     identifier: str
@@ -463,10 +463,35 @@ def _compare_values(
     )
 
 
+def _compare_stdout(
+    stdout: str,
+    other: typing.Any,
+) -> pyine.utils.code.output_compare.CompareResult:
+    """Compare stdout softly, also accepting a list of strings joined with newlines."""
+    comparison = _compare_values(stdout, other)
+    if not comparison and isinstance(other, list) and all(isinstance(item, str) for item in other):
+        merged_comparison = _compare_values(stdout, "\n".join(typing.cast("list[str]", other)))
+        if merged_comparison:
+            return merged_comparison
+    return comparison
+
+
 def resolve_trace_outcome(
     trace_result: pyine.utils.code.execution.TraceResult,
 ) -> ResolvedOutcome:
-    """Resolve an expected-independent outcome using the export's strict channel policy."""
+    """Select the authoritative outcome using ``strict-channel-v1``.
+
+    Args:
+        trace_result: Stored or freshly executed trace containing its entrypoint,
+            return value, stdout, exception, and source-test expectation.
+
+    Returns:
+        The selected channel/value plus its soft comparison with the source expectation.
+        Exceptions take precedence, except that a script's SystemExit with nonempty
+        stdout uses that stdout. Otherwise callables use their return value and scripts
+        use stdout. The expectation never determines which channel wins, and this
+        function does not validate or re-execute the trace.
+    """
     expected_output = trace_result.expected_output
     if trace_result.exception is not None:
         exception_value = str(trace_result.exception)
@@ -479,20 +504,37 @@ def resolve_trace_outcome(
     if trace_result.entrypoint_name is not None:
         comparison = _compare_values(trace_result.return_value, expected_output)
         return ResolvedOutcome("return_value", trace_result.return_value, bool(comparison), comparison.reason)
-    stdout_comparison = _compare_values(trace_result.stdout, expected_output)
+    stdout_comparison = _compare_stdout(trace_result.stdout, expected_output)
     if stdout_comparison:
         return ResolvedOutcome("stdout", trace_result.stdout, True, stdout_comparison.reason)
-    if isinstance(expected_output, list) and all(isinstance(item, str) for item in expected_output):
-        expected_strings = typing.cast("list[str]", expected_output)
-        merged_comparison = _compare_values(trace_result.stdout, "\n".join(expected_strings))
-        if merged_comparison:
-            return ResolvedOutcome("stdout", trace_result.stdout, True, merged_comparison.reason)
     return ResolvedOutcome(
         "stdout",
         trace_result.stdout,
         False,
         f"unexpected stdout output: {stdout_comparison.reason}",
     )
+
+
+def compare_candidate(
+    outcome: ResolvedOutcome,
+    candidate: typing.Any,
+) -> bool:
+    """Grade a candidate against an already resolved authoritative outcome.
+
+    Args:
+        outcome: Actual execution outcome selected by ``resolve_trace_outcome`` or
+            certification. Its source-test expectation does not determine this label.
+        candidate: Proposed Python value or display representation. Comparison uses
+            ``pyine-soft-v1`` tolerances and container rules. For stdout outcomes, a
+            list of strings is also compared after joining its elements with newlines.
+
+    Returns:
+        Whether the candidate matches the resolved value. This does not assert an
+        outcome channel or exact Python type and does not execute the program.
+    """
+    if outcome.kind == "stdout":
+        return bool(_compare_stdout(outcome.value, candidate))
+    return bool(_compare_values(outcome.value, candidate))
 
 
 def _hash_for_assignment(
@@ -509,7 +551,19 @@ def assign_export_split(
     problem_identifier: str,
     config: EvalExportConfig,
 ) -> ExportSplitName:
-    """Assign a full problem identifier to a deterministic derived partition."""
+    """Assign a whole problem family to a deterministic derived partition.
+
+    Args:
+        problem_identifier: Full original problem identity, shared by all of its
+            solutions, tests, and augmentations. Do not pass a trace identifier.
+        config: Validated export settings supplying the seed and train/validation/test
+            fractions. Other selection and certification settings do not affect assignment.
+
+    Returns:
+        ``train``, ``validation``, or ``test`` from a domain-separated seeded hash.
+        Assignment is independent of traversal order and available problem count;
+        fractions specify probabilities rather than exact partition sizes.
+    """
     unit_interval = _hash_for_assignment("split", config.seed, problem_identifier) / (1 << 256)
     if unit_interval < config.train_fraction:
         return "train"
@@ -522,7 +576,17 @@ def select_problem_identifiers(
     problem_identifiers: typing.Iterable[str],
     config: EvalExportConfig,
 ) -> set[str]:
-    """Apply the optional deterministic whole-problem cap."""
+    """Apply an order-independent cap to already eligible whole-problem identities.
+
+    Args:
+        problem_identifiers: Iterable of eligible full problem identifiers. Duplicates
+            are removed; this helper does not check original splits or source eligibility.
+        config: Settings supplying ``seed`` and optional ``max_problem_count``.
+
+    Returns:
+        All unique identities when uncapped or below the cap; otherwise the capped set
+        selected by a deterministic seeded hash rank. No trace-level subsampling occurs.
+    """
     unique_identifiers = set(problem_identifiers)
     if config.max_problem_count is None or len(unique_identifiers) <= config.max_problem_count:
         return unique_identifiers
@@ -550,7 +614,20 @@ def validate_trace_record(
     trace_metadata: pyine.data.traces.dataset_utils.TraceMetadata,
     problem: pyine.data.traces.dataset_utils.CodingProblem,
 ) -> CertificationResult:
-    """Check integrity between a stored trace and metadata derived from that same record."""
+    """Check consistency between a stored trace, its index metadata, and its problem.
+
+    Args:
+        trace_result: Native trace record to check, without modifying or executing it.
+        trace_metadata: Reader metadata for that same record, including code, inputs,
+            outputs, exception, streams, identity, and valid-step count.
+        problem: Parent coding problem used to check problem identity and entrypoint.
+
+    Returns:
+        A ``record_integrity_checked`` certification result with pass/fail status,
+        mismatch reasons, and the resolved stored outcome. Expected record mismatches
+        are returned as failures rather than raised. Passing checks do not independently
+        validate intermediate assertions, prove source-test correctness, or apply bans.
+    """
     start_time = time.perf_counter()
     failures: list[str] = []
     if trace_result.identifier is None:
@@ -617,7 +694,27 @@ def certify_trace(
     problem: pyine.data.traces.dataset_utils.CodingProblem,
     config: EvalExportConfig,
 ) -> CertificationResult:
-    """Check record integrity and optionally perform outcome-only safe re-execution."""
+    """Check record integrity and optionally perform outcome-only safe re-execution.
+
+    Args:
+        trace_result: Native execution record whose code/input outcome is being certified.
+        trace_metadata: Reader metadata for the same record, checked before any rerun.
+        problem: Parent problem used for identity and entrypoint validation.
+        config: Certification settings: opt-in step threshold or all-traces selection,
+            per-run timeout, and optional execution-seed override. Without opt-in,
+            certification checks stored-record integrity only.
+
+    Returns:
+        A certification result recording its method, status, reason, selected evidence
+        source, and optional exact/semantic rerun comparisons. Integrity failures prevent
+        execution. A passing same-channel soft rerun match selects the live outcome;
+        rerun errors or mismatches produce failed results retaining stored evidence.
+
+    Notes:
+        Reruns use the safe execution wrapper with event capture disabled, so they cannot
+        certify stored intermediate events. Ordinary rerun exceptions become diagnostics;
+        process-control interruptions propagate to the caller.
+    """
     start_time = time.perf_counter()
     record_result = validate_trace_record(trace_result, trace_metadata, problem)
     if record_result.outcome == "fail" or not _should_reexecute(trace_result, config):
@@ -714,7 +811,13 @@ def _get_recheck_method(
 
 
 def get_eval_export_schema() -> pa.Schema:
-    """Return the explicit, shared Arrow schema for every derived partition."""
+    """Return the fixed facts-v1 schema shared by all derived partitions.
+
+    Returns:
+        An Arrow schema with explicit field types and nullability for source identities,
+        task/fact values, outcome evidence, flags, and certification results. Empty
+        partitions use the same schema; v2 uses ``get_statement_export_schema`` instead.
+    """
     return pa.schema(
         [
             pa.field("identifier", pa.string(), nullable=False),
@@ -890,11 +993,11 @@ def _validate_output_paths_available(config: EvalExportConfig) -> pathlib.Path:
     return staging_dir
 
 
-def _build_trace_references(
+def build_trace_references(
     readers: list[pyine.data.traces.dataset_reader.DatasetProtocol],
     split_result: pyine.data.utils.splits.SplitResult,
     config: EvalExportConfig,
-) -> dict[ExportSplitName, list[_TraceReference]]:
+) -> dict[ExportSplitName, list[TraceReference]]:
     """Index train-scoped source traces and assign their problems to derived partitions."""
     candidate_problem_identifiers: list[str] = []
     candidate_metadata: list[tuple[int, int, pyine.data.traces.dataset_utils.TraceMetadata]] = []
@@ -912,7 +1015,7 @@ def _build_trace_references(
             candidate_problem_identifiers.append(problem_identifier)
             candidate_metadata.append((reader_idx, trace_idx, trace_metadata))
     selected_problems = select_problem_identifiers(candidate_problem_identifiers, config)
-    references: dict[ExportSplitName, list[_TraceReference]] = {
+    references: dict[ExportSplitName, list[TraceReference]] = {
         "train": [],
         "validation": [],
         "test": [],
@@ -923,7 +1026,7 @@ def _build_trace_references(
             continue
         export_split = assign_export_split(problem_identifier, config)
         references[export_split].append(
-            _TraceReference(
+            TraceReference(
                 identifier=trace_metadata.identifier,
                 reader_idx=reader_idx,
                 trace_idx=trace_idx,
@@ -951,7 +1054,7 @@ def _get_outcome_digest(outcome: ResolvedOutcome) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _get_certification_log_payload(certification: CertificationResult) -> dict[str, typing.Any]:
+def get_certification_log_payload(certification: CertificationResult) -> dict[str, typing.Any]:
     """Project a certification result into a compact JSON-safe audit record."""
     return {
         "identifier": certification.identifier,
@@ -985,7 +1088,7 @@ def _certify_loaded_trace(
 
 def _write_partition(
     split_name: ExportSplitName,
-    references: list[_TraceReference],
+    references: list[TraceReference],
     readers: list[pyine.data.traces.dataset_reader.DatasetProtocol],
     path: pathlib.Path,
     certification_log: typing.TextIO,
@@ -1076,7 +1179,7 @@ def _write_partition(
                 certification_counts[certification.method][certification.outcome] += 1
                 _write_json_line(
                     certification_log,
-                    _get_certification_log_payload(certification),
+                    get_certification_log_payload(certification),
                 )
                 row = _project_trace_row(
                     trace_result,
@@ -1104,7 +1207,7 @@ def _write_partition(
             parquet_writer.write_table(pa.Table.from_pylist(pending_rows, schema=schema))
 
 
-def _get_source_shard_info(
+def get_source_shard_info(
     path: pathlib.Path,
     reader: pyine.data.traces.dataset_reader.DatasetProtocol,
 ) -> SourceShardInfo:
@@ -1133,7 +1236,7 @@ def _get_source_shard_info(
     )
 
 
-def _validate_source_shards(
+def validate_source_shards(
     source_shards: list[SourceShardInfo],
     config: EvalExportConfig,
 ) -> None:
@@ -1189,7 +1292,7 @@ def _validate_numbered_shard_coverage(
         )
 
 
-def _validate_source_problem_hashes(
+def validate_source_problem_hashes(
     readers: list[pyine.data.traces.dataset_reader.DatasetProtocol],
     split_result: pyine.data.utils.splits.SplitResult,
 ) -> None:
@@ -1228,7 +1331,7 @@ def _write_support_files(
     output_paths: dict[str, pathlib.Path],
 ) -> str:
     """Copy the frozen contract and write schema and installed-package inventories."""
-    specification_source = pathlib.Path(__file__).with_name("EVAL_EXPORT_SPEC.md")
+    specification_source = pathlib.Path(__file__).with_name("EVAL_EXPORT_SPEC_V1.md")
     if not specification_source.is_file():
         raise FileNotFoundError(f"missing packaged evaluation export specification: {specification_source}")
     shutil.copyfile(specification_source, output_paths["specification"])
@@ -1290,10 +1393,25 @@ def export_eval_traces(config: EvalExportConfig) -> ExportManifest:
     """Export train-scoped PyINE traces to deterministic local Parquet partitions.
 
     Args:
-        config: Validated export configuration.
+        config: Validated source LMDB paths, original split, fresh output directory,
+            whole-problem selection/split settings, and certification/write controls.
+            Only original-training problem families participate. Re-execution is opt-in.
 
     Returns:
-        The completed export manifest.
+        The completed facts-v1 manifest, also saved in the output directory, containing
+        partition row/problem counts, source provenance, certification summaries, and
+        artifact hashes. V1 retains banned and failed-certification rows with diagnostic
+        flags; consumers must apply their intended filtering policy.
+
+    Raises:
+        FileExistsError: The output or its sibling incomplete directory already exists.
+        ValueError: Sources or split hashes are inconsistent, no eligible original-training
+            traces exist, or final artifact validation fails.
+
+    Notes:
+        Readers may prepare source metadata caches. Output files, certification logs,
+        and support files are written to a sibling incomplete directory and promoted
+        only after validation. Failed exports can leave that incomplete directory.
     """
     _validate_output_paths_available(config)
     split_result = pyine.data.utils.splits.SplitResult.from_file(config.split_file_path)
@@ -1312,11 +1430,11 @@ def export_eval_traces(config: EvalExportConfig) -> ExportManifest:
                 f"configured source {config.source_dataset_name!r}"
             )
     source_shards = [
-        _get_source_shard_info(path, reader) for path, reader in zip(config.source_lmdb_paths, readers, strict=True)
+        get_source_shard_info(path, reader) for path, reader in zip(config.source_lmdb_paths, readers, strict=True)
     ]
-    _validate_source_shards(source_shards, config)
-    _validate_source_problem_hashes(readers, split_result)
-    references = _build_trace_references(readers, split_result, config)
+    validate_source_shards(source_shards, config)
+    validate_source_problem_hashes(readers, split_result)
+    references = build_trace_references(readers, split_result, config)
     if not any(references.values()):
         raise ValueError("no source traces belong to problems assigned to PyINE's original train partition")
     staging_dir, output_paths = _prepare_output_paths(config)

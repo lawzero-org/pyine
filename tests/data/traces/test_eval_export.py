@@ -513,12 +513,12 @@ class TestSourceValidation:
         ]
         config = _make_config(tmp_path)
         with pytest.raises(ValueError, match="incomplete numbered source shard set"):
-            pyine.data.traces.eval_export._validate_source_shards(  # type: ignore[reportPrivateUsage]
+            pyine.data.traces.eval_export.validate_source_shards(  # type: ignore[reportPrivateUsage]
                 shards,
                 config,
             )
         partial_config = config.model_copy(update={"allow_partial_source": True})
-        pyine.data.traces.eval_export._validate_source_shards(  # type: ignore[reportPrivateUsage]
+        pyine.data.traces.eval_export.validate_source_shards(  # type: ignore[reportPrivateUsage]
             shards,
             partial_config,
         )
@@ -540,7 +540,7 @@ class TestSourceValidation:
             for shard_idx in (1, 2)
         ]
         with pytest.raises(ValueError, match="incompatible writer configurations"):
-            pyine.data.traces.eval_export._validate_source_shards(  # type: ignore[reportPrivateUsage]
+            pyine.data.traces.eval_export.validate_source_shards(  # type: ignore[reportPrivateUsage]
                 shards,
                 _make_config(tmp_path),
             )
@@ -569,7 +569,7 @@ class TestSourceValidation:
             ),
         )
         with pytest.raises(ValueError, match="source problem hash does not match"):
-            pyine.data.traces.eval_export._validate_source_problem_hashes(  # type: ignore[reportPrivateUsage]
+            pyine.data.traces.eval_export.validate_source_problem_hashes(  # type: ignore[reportPrivateUsage]
                 [reader],
                 split_result,
             )
@@ -597,7 +597,7 @@ class TestSourceValidation:
             ),
         )
         with pytest.raises(ValueError, match="absent from the supplied split"):
-            pyine.data.traces.eval_export._validate_source_problem_hashes(  # type: ignore[reportPrivateUsage]
+            pyine.data.traces.eval_export.validate_source_problem_hashes(  # type: ignore[reportPrivateUsage]
                 [reader],
                 split_result,
             )
@@ -863,7 +863,8 @@ class TestEvalExportCli:
         certification_log_path = output_dir / manifest["certification_log"]["relative_path"]
         assert manifest["certification_log"]["sha256"] == pyine.utils.reprod.compute_hash(certification_log_path)
         assert manifest["source_split"]["file"]["sha256"] == pyine.utils.reprod.compute_hash(split_file_path)
-        assert (output_dir / "EVAL_EXPORT_SPEC.md").is_file()
+        v1_specification = pathlib.Path(pyine.data.traces.eval_export.__file__).with_name("EVAL_EXPORT_SPEC_V1.md")
+        assert (output_dir / "EVAL_EXPORT_SPEC.md").read_bytes() == v1_specification.read_bytes()
         assert (output_dir / "export_schema.json").is_file()
         assert (output_dir / "installed_packages.json").is_file()
         assert not output_dir.with_name(f"{output_dir.name}.incomplete").exists()

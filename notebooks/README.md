@@ -32,6 +32,10 @@ Entry-point notebooks that walk through core PyINE APIs end-to-end.
 
 EDA on raw source datasets, traces, deltas, and sample-builder outputs.
 
+- [`eval_export_explorer.ipynb`](./eval_export_explorer.ipynb): inspect a completed evaluation export
+  (v1 or v2, public or author): split sizes, labels, query groups, categories, text budgets, the
+  displayed-return shortcut, and rendered examples. Set `EXPORT_DIR` or `PYINE_EVAL_EXPORT_DIR` and
+  run all cells.
 - [`taco_source_data_viz.ipynb`](./taco_source_data_viz.ipynb): quick tour and visualization of
   the original TACO source dataset, including solution counts, lengths, difficulty distributions,
   and tag analysis.

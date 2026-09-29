@@ -1,0 +1,8 @@
+recipe_version: 1
+code_selection:
+  mode: bugged_only
+variants:
+  faithful: true
+  bugged_own_reasoning: true
+  alternate_input_suffix:
+    enabled: false

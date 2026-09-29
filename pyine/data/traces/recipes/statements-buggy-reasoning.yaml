@@ -1,0 +1,10 @@
+recipe_version: 1
+code_selection:
+  exclude_categories: [code.bugged]
+variants:
+  faithful: true
+  alternate_input_suffix:
+    enabled: false
+  buggy_reasoning_suffix:
+    enabled: true
+    whole_replacement_probability: 0.1

@@ -17,6 +17,7 @@ import pathlib
 import typing
 
 import msgspec
+import pydantic
 import torch.utils.data
 
 import pyine.data.traces.dataset_utils
@@ -223,6 +224,12 @@ class DatasetReader(torch.utils.data.Dataset[pyine.utils.code.execution.TraceRes
             typing.cast("dict[str, str]", decoded_data["augment_key_to_parent_trace_key"])
         )
         metadata_payload = typing.cast("list[dict[str, typing.Any]]", decoded_data["trace_metadata"])
+        exception_adapter: pydantic.TypeAdapter[pyine.utils.code.execution.TraceException | None] = (
+            pydantic.TypeAdapter(pyine.utils.code.execution.TraceException | None)
+        )
+        for trace_meta in metadata_payload:
+            # msgpack decodes the NamedTuple as a plain list, which never equals the stored record
+            trace_meta["exception"] = exception_adapter.validate_python(trace_meta["exception"])
         self.trace_metadata = [
             pyine.data.traces.dataset_utils.TraceMetadata(**trace_meta) for trace_meta in metadata_payload
         ]

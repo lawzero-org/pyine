@@ -1,0 +1,18 @@
+recipe_version: 1
+queries:
+  max_additional_observed_negatives: 1
+variants:
+  faithful: true
+  alternate_input_suffix:
+    enabled: true
+    whole_replacement_probability: 0.1
+budget:
+  unit: characters
+  maximum: 16000
+coverage:
+  minimum_counts: {}
+visibility:
+  categories:
+    train: false
+    validation: true
+    test: false
