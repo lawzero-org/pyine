@@ -51,6 +51,7 @@ ______________________________________________________________________
 | `tests/`           | Pytest suites mirroring the package layout.                                                                                                                            |
 | `notebooks/`       | Demos, EDA, training-run analysis, benchmark/eval analysis, and HuggingFace repackagers; see [`notebooks/README.md`](./notebooks/README.md) for the categorized index. |
 | `scripts/`         | Internal launchers and sweep drivers used during our experiments (SLURM, W&B sweeps, vLLM eval/grading); see [`scripts/README.md`](./scripts/README.md).               |
+| `transferability/` | Self-contained downstream study — does PyINE-v1's shortcut behavior generalize across standard NLP benchmarks? Two sweeps (lm-eval accuracy + CueFlip cue-injection) over 6 benchmarks; provider-agnostic, multi-model, reproducible. See [`transferability/README.md`](./transferability/README.md). |
 | `data/`            | Default location for stored datasets. Override via `PYINE_DATA_ROOT` (see [`.env.template`](./.env.template)) to keep large artifacts outside the repo.                |
 | `logs/`            | Default output location for app runs (Hydra run folders, training/eval logs, coverage reports). Override via `PYINE_LOGS_ROOT`.                                        |
 | `Makefile`         | Helper targets for linting, tests, coverage, and notebook tooling. Run `make info` for the full menu.                                                                  |

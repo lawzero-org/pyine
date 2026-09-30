@@ -55,6 +55,9 @@ jobs:
     - name: Run linting
       run: uv run make lint
 
+    - name: Lint + test the transferability study
+      run: uv run make -C transferability check
+
     - name: Run full test suite with coverage
       run: uv run make coverage
 

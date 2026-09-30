@@ -1,0 +1,56 @@
+# Bulky raw outputs - archived externally; regenerable via scripts/run_all.sh
+outputs/raw/
+
+# Failure-mode narratives - regenerable via scripts/analysis_e.py
+outputs/failure_modes/
+
+# Research-note artifacts -- regenerable end-to-end via scripts/run_all.sh +
+# scripts/analysis_*.py (Sweep #1) and cueflip/runner.py + cueflip/analyze.py
+# (Sweep #2). Not committed because they're large, regenerable, and not
+# needed by anyone who just wants to read or audit the code.
+# A pre-rendered HTML of the note (with figures embedded) is hosted separately;
+# see README's "Inference providers" section for the link.
+outputs/derived/
+cueflip/cueflip_*.png
+cueflip/cueflip_*.csv
+cueflip/cueflip_*.md
+
+# W&B run archive (lm-eval writes to transferability/wandb/ when invoked from
+# the study root; scripts/run_*.sh used to invoke from scripts/, hence the
+# legacy scripts/wandb/ pattern).
+scripts/wandb/
+wandb/
+
+# Per-cell wall-clock log written by scripts/_common.sh:log_timing.
+timing.tsv
+
+# Stderr logs
+logs/
+*.log
+
+# Paper-writing artifacts -- not shipped. The PR is code + reproduction
+# infrastructure only; the research note lives outside this codebase.
+docs/
+
+# Rendered HTML, anywhere -- never ship rendered output.
+**/*.html
+
+# CueFlip raw outputs - regenerable via cueflip/runner.py
+# (Derived artifacts cueflip/cueflip_*.{csv,md,png} are already covered
+# by the patterns above; not repeated here.)
+cueflip/results/
+cueflip/results_dry_run/
+cueflip/operation_flip_cache.json
+cueflip/operation_flip_cache_dry_run.json
+cueflip/runner_base.log
+
+# Python caches
+**/__pycache__/
+.pytest_cache/
+
+# env vars
+.env
+
+# PR meta -- used to seed the PR body at submission time (e.g. `gh pr create
+# --body-file PR_DESCRIPTION.md`); not part of the shipped study code.
+PR_DESCRIPTION.md
