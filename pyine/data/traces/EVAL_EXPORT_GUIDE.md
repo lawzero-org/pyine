@@ -308,6 +308,10 @@ shard subsets separately. Lowering the recipe's `event_cache_size` or the CLI's
 `donor_search_limit` and `max_oracle_matches` bound rare expensive searches; reaching them skips views
 (and reports it) rather than mislabeling them.
 
+Construction runs on one core. About once a minute, the log reports each phase's progress (certifying
+traces, building query groups, validating author rows, and projecting each split), with its rate and an
+estimate of the time left.
+
 ## Inspect an export
 
 Open `notebooks/eval_export_explorer.ipynb`, set `EXPORT_DIR` (or `PYINE_EVAL_EXPORT_DIR`) to a public or

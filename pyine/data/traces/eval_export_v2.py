@@ -12,6 +12,7 @@ import hashlib
 import importlib.metadata
 import itertools
 import json
+import logging
 import pathlib
 import random
 import re
@@ -39,9 +40,12 @@ import pyine.utils.code.output_compare
 import pyine.utils.concurrency
 import pyine.utils.reprod
 
+logger = logging.getLogger(__name__)
+
 SCHEMA_VERSION = "2.0.0"
 STATEMENT_TARGET_VERSION = "reference-execution-v1"
 SPLITS = ("train", "validation", "test")
+PROGRESS_INTERVAL_SECONDS = 60.0
 EXECUTION_POLICY_KEYS = (
     "seed",
     "blacklisted_modules",
@@ -260,6 +264,61 @@ def _categories(identifier: trace_utils.TraceIdentifier) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _format_duration(seconds: float) -> str:
+    """Format a duration compactly, such as ``4h07m``, ``12m30s``, or ``45s``."""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+class _Progress:
+    """Log a long phase's progress at most once per interval, with its rate and remaining time."""
+
+    def __init__(
+        self,
+        phase: str,
+        total: int,
+        unit: str,
+        details: typing.Callable[[], str] | None = None,
+        interval_seconds: float = PROGRESS_INTERVAL_SECONDS,
+    ) -> None:
+        """Start timing a phase of ``total`` items and log its start."""
+        self.phase, self.total, self.unit, self.details = phase, total, unit, details
+        self.interval_seconds = interval_seconds
+        self.count = 0
+        self.started = self.logged = time.perf_counter()
+        logger.info(f"{phase}: started, {total:,} {unit}")
+
+    def advance(
+        self,
+        count: int = 1,
+    ) -> None:
+        """Count processed items, logging progress once the interval has elapsed."""
+        self.count += count
+        now = time.perf_counter()
+        if now - self.logged < self.interval_seconds:
+            return
+        self.logged = now
+        rate = self.count / max(now - self.started, 1e-9)
+        percent = 100 * self.count / self.total if self.total else 100.0
+        remaining = _format_duration(max(self.total - self.count, 0) / rate) if rate > 0 else "unknown"
+        logger.info(
+            f"{self.phase}: {self.count:,}/{self.total:,} {self.unit} ({percent:.1f}%), {rate:,.1f}/s, "
+            f"about {remaining} left{self._details()}"
+        )
+
+    def finish(self) -> None:
+        """Log the phase's completion and duration."""
+        elapsed = _format_duration(time.perf_counter() - self.started)
+        logger.info(f"{self.phase}: done, {self.count:,} {self.unit} in {elapsed}{self._details()}")
+
+    def _details(self) -> str:
+        """Return the caller's extra context, formatted for appending to a log line."""
+        return f"; {self.details()}" if self.details is not None else ""
+
+
 def _load_sources(
     config: legacy.EvalExportConfig,
 ) -> tuple[list[trace_reader.DatasetProtocol], dict[str, typing.Any], list[legacy.TraceReference]]:
@@ -284,7 +343,11 @@ def _load_sources(
         "pyine_commit": pyine.utils.reprod.get_git_revision_hash(),
         "pyine_version": pyine.utils.reprod.get_framework_version(),
     }
-    return readers, source, [reference for split_name in SPLITS for reference in references[split_name]]
+    selected = [reference for split_name in SPLITS for reference in references[split_name]]
+    split_counts = ", ".join(f"{len(references[split_name]):,} {split_name}" for split_name in SPLITS)
+    problem_count = len({reference.problem_identifier for reference in selected})
+    logger.info(f"selected {len(selected):,} source traces from {problem_count:,} problems ({split_counts})")
+    return readers, source, selected
 
 
 def _certified_records(
@@ -298,9 +361,16 @@ def _certified_records(
     tuple[legacy.TraceReference, execution.TraceResult, trace_utils.CodingProblem, legacy.CertificationResult]
 ]:
     """Load eligible traces in batches and certify their outcomes in parallel."""
+    progress = _Progress(
+        "certifying source traces",
+        len(references),
+        "traces",
+        lambda: f"{counts['eligible.outcome_contexts']:,} eligible",
+    )
     for start in range(0, len(references), config.certification_workers):
+        batch = references[start : start + config.certification_workers]
         loaded = []
-        for reference in references[start : start + config.certification_workers]:
+        for reference in batch:
             reader = readers[reference.reader_idx]
             problem = reader.get_problem_data(reference.trace_idx)
             counts["source.contexts"] += 1
@@ -311,22 +381,23 @@ def _certified_records(
             if trace.identifier != reference.identifier or str(problem.problem_id) != reference.problem_identifier:
                 raise ValueError("source identity changed after indexing")
             loaded.append((reference, trace, problem, reader.get_trace_metadata(reference.trace_idx)))
-        if not loaded:
-            continue
-        results, errors = pyine.utils.concurrency.run_in_parallel(
-            [
-                functools.partial(legacy.certify_trace, trace, metadata, problem, config)
-                for _, trace, problem, metadata in loaded
-            ],
-            use_processes=False,
-            max_workers=config.certification_workers,
-        )
-        for (reference, trace, problem, _), result, error in zip(loaded, results, errors, strict=True):
-            if error is not None:
-                raise error
-            if not isinstance(result, legacy.CertificationResult):
-                raise TypeError("invalid certification worker result")
-            yield reference, trace, problem, result
+        if loaded:
+            results, errors = pyine.utils.concurrency.run_in_parallel(
+                [
+                    functools.partial(legacy.certify_trace, trace, metadata, problem, config)
+                    for _, trace, problem, metadata in loaded
+                ],
+                use_processes=False,
+                max_workers=config.certification_workers,
+            )
+            for (reference, trace, problem, _), result, error in zip(loaded, results, errors, strict=True):
+                if error is not None:
+                    raise error
+                if not isinstance(result, legacy.CertificationResult):
+                    raise TypeError("invalid certification worker result")
+                yield reference, trace, problem, result
+        progress.advance(len(batch))
+    progress.finish()
 
 
 def _index_contexts(
@@ -962,6 +1033,7 @@ def export_statements(
         contexts = _resolve_originals(
             _index_contexts(readers, references, config, recipe, counts, skip, cert_file), counts
         )
+        logger.info(f"indexed {len(contexts):,} eligible contexts")
         pools: dict[str, list[_Context]] = collections.defaultdict(list)
         buggy_donors: dict[str, list[_Context]] = collections.defaultdict(list)
         for context in contexts.values():
@@ -1112,12 +1184,21 @@ def export_statements(
         pending: list[dict[str, typing.Any]] = []
         with pq.ParquetWriter(stage / "examples.parquet", author_schema, compression="zstd") as writer:
             # problems stay contiguous for consumers, and each donor pool for the small event cache
-            for recipient in sorted(
-                contexts.values(),
-                key=lambda context: (_problem_id(context), context.pool_key, context.reference.identifier),
-            ):
-                if not recipe.code_selection.selects(recipient.categories):
-                    continue
+            recipients = [
+                recipient
+                for recipient in sorted(
+                    contexts.values(),
+                    key=lambda context: (_problem_id(context), context.pool_key, context.reference.identifier),
+                )
+                if recipe.code_selection.selects(recipient.categories)
+            ]
+            progress = _Progress(
+                "building query groups",
+                len(recipients),
+                "recipients",
+                lambda: f"{counts['emitted.groups']:,} groups, {counts['emitted.rows']:,} rows",
+            )
+            for recipient in recipients:
                 for rows in recipient_groups(recipient):
                     for row in rows:
                         if row["row_id"] in seen_ids:
@@ -1128,8 +1209,10 @@ def export_statements(
                     if len(pending) >= config.parquet_batch_size:
                         writer.write_table(pa.Table.from_pylist(pending, schema=author_schema))
                         pending.clear()
+                progress.advance()
             if pending:
                 writer.write_table(pa.Table.from_pylist(pending, schema=author_schema))
+            progress.finish()
     counts["emitted.contexts"] = len(emitted_contexts)
     for name, minimum in recipe.coverage.minimum_counts.items():
         if name not in counts:
@@ -1187,6 +1270,7 @@ def export_statements(
     _write_json(stage / "author_manifest.json", author_manifest)
     _validate_author(stage)
     stage.rename(author_output_dir)
+    logger.info(f"author artifact written to {author_output_dir}")
     return project_statements(author_output_dir, config.output_dir, recipe.visibility, config.parquet_batch_size)
 
 
@@ -1287,6 +1371,7 @@ def _validate_author(root: pathlib.Path) -> dict[str, typing.Any]:
     displayed_labels: dict[bytes, bool] = {}
     finished: dict[str, set[str]] = {"problem_id": set(), "context_id": set()}
     current: dict[str, str | None] = {"problem_id": None, "context_id": None}
+    progress = _Progress("validating author rows", manifest["counts"].get("emitted.rows", 0), "rows")
     rows = consumer.iter_examples(root / "examples.parquet")
     for group_id, group_rows in itertools.groupby(rows, key=lambda row: row["query_group_id"]):
         if group_id in group_ids:
@@ -1307,6 +1392,8 @@ def _validate_author(root: pathlib.Path) -> dict[str, typing.Any]:
             if displayed_labels.setdefault(_displayed_task_key(row), row["label"]) is not row["label"]:
                 raise ValueError("identical displayed task and candidate carry different labels")
         _validate_author_group(group)
+        progress.advance(len(group))
+    progress.finish()
     if len(row_ids) != manifest["counts"].get("emitted.rows", 0) or len(group_ids) != manifest["counts"].get(
         "emitted.groups", 0
     ):
@@ -1349,7 +1436,9 @@ def _mixture_selection(
     supply: dict[str, collections.Counter[str]] = {split: collections.Counter() for split in SPLITS}
     columns = ["export_split", "query_group_id", "category_labels", "author.pairing_id", "author.pairing_kind"]
     previous_group = None
-    for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_size, columns=columns):
+    parquet = pq.ParquetFile(path)
+    progress = _Progress("reading mixture families", parquet.metadata.num_rows, "rows")
+    for batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
         for row in batch.to_pylist():
             if row["query_group_id"] == previous_group:
                 continue
@@ -1357,6 +1446,8 @@ def _mixture_selection(
             family = _mixture_family(row)
             supply[row["export_split"]][family] += 1
             pairing_sizes[row["export_split"], family][row["author"]["pairing_id"]] += 1
+        progress.advance(batch.num_rows)
+    progress.finish()
     shares = mixture.model_dump()
     kept: set[str] = set()
     for split, available in supply.items():
@@ -1477,8 +1568,15 @@ def project_statements(
     shortcut_counts: collections.Counter[str] = collections.Counter()
     for split in SPLITS:
         pending: list[dict[str, typing.Any]] = []
+        progress = _Progress(
+            f"projecting {split}",
+            manifest["counts"].get("emitted.rows", 0),
+            "author rows",
+            lambda split=split: f"{counts[split]['rows']:,} {split} rows written",
+        )
         with pq.ParquetWriter(stage / f"{split}.parquet", schema, compression="zstd") as writer:
             for author_group in consumer.iter_groups(author_dir / "examples.parquet", batch_size):
+                progress.advance(len(author_group))
                 if author_group[0]["export_split"] != split:
                     continue
                 if kept_pairings is not None and author_group[0]["author"]["pairing_id"] not in kept_pairings:
@@ -1491,6 +1589,7 @@ def project_statements(
                     pending.clear()
             if pending:
                 writer.write_table(pa.Table.from_pylist(pending, schema=schema))
+        progress.finish()
         counts[split]["problems"] = len(problems[split])
         counts[split]["contexts"] = len(contexts[split])
         counts[split]["groups"] = len(groups[split])
@@ -1572,6 +1671,7 @@ def project_statements(
     _write_json(stage / "export_manifest.json", public_manifest)
     _check_files(stage, public_manifest)
     stage.rename(public_dir)
+    logger.info(f"public artifact written to {public_dir}")
     return public_manifest
 
 
@@ -1614,7 +1714,9 @@ def report_source(
     cut_pools: dict[str, list[tuple[str, legacy.ResolvedOutcome, set[events.CutKey], set[events.CutKey]]]] = (
         collections.defaultdict(list)
     )
+    progress = _Progress("inspecting source traces", len(references), "traces")
     for reference in references:
+        progress.advance()
         reader = readers[reference.reader_idx]
         problem = reader.get_problem_data(reference.trace_idx)
         counts["selected.contexts"] += 1
@@ -1646,6 +1748,7 @@ def report_source(
                 cut_pools[_pool_key(trace, reference)].append(
                     (input_key, integrity.selected_outcome, recipient_cuts, donor_cuts)
                 )
+    progress.finish()
     if inspect_events:
         for name in ("negative_pairs", "shared_cut_pairs", "no_shared_cut_pairs"):
             counts[f"cuts.alternate_input.{name}"] = 0

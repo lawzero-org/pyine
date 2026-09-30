@@ -4,6 +4,7 @@ import hashlib
 import io
 import itertools
 import json
+import logging
 import pathlib
 import subprocess
 import sys
@@ -60,6 +61,37 @@ def _config(
     return legacy.EvalExportConfig(
         source_lmdb_paths=[source[0]], split_file_path=source[1], output_dir=output, **updates
     )
+
+
+class _MessageCollector(logging.Handler):
+    """Collect formatted log messages."""
+
+    def __init__(self) -> None:
+        """Start with no messages."""
+        super().__init__(logging.INFO)
+        self.messages: list[str] = []
+
+    def emit(
+        self,
+        record: logging.LogRecord,
+    ) -> None:
+        """Store one record's message."""
+        self.messages.append(record.getMessage())
+
+
+@pytest.fixture()
+def exporter_logs() -> typing.Iterator[list[str]]:
+    """Collect exporter INFO messages directly, since earlier app tests may reconfigure global logging."""
+    exporter_logger = logging.getLogger(exporter.__name__)
+    level, propagate = exporter_logger.level, exporter_logger.propagate
+    collector = _MessageCollector()
+    exporter_logger.addHandler(collector)
+    exporter_logger.setLevel(logging.INFO)
+    exporter_logger.propagate = False
+    yield collector.messages
+    exporter_logger.removeHandler(collector)
+    exporter_logger.setLevel(level)
+    exporter_logger.propagate = propagate
 
 
 @pytest.fixture(scope="module")
@@ -703,6 +735,32 @@ class TestExportPipeline:
         unmixed = exporter.project_statements(author, tmp_path / "unmixed", mixture=None)
         assert sum(unmixed["partition_row_counts"].values()) == sum(len(rows) for rows in author_groups)
         assert unmixed["mixture"] is None
+
+    def test_every_phase_logs_its_progress(
+        self,
+        native_source: tuple[pathlib.Path, pathlib.Path],
+        tmp_path: pathlib.Path,
+        exporter_logs: list[str],
+    ) -> None:
+        author = tmp_path / "author"
+        exporter.export_statements(_config(native_source, tmp_path / "public"), author)
+        exporter.project_statements(
+            author, tmp_path / "mixed", mixture=contract.Mixture(clean_code=0.5, bugged_code=0.5)
+        )
+        exporter.report_source(_config(native_source, tmp_path / "unused"))
+        messages = exporter_logs
+        phases = [
+            "certifying source traces",
+            "building query groups",
+            "validating author rows",
+            "reading mixture families",
+            *(f"projecting {split}" for split in exporter.SPLITS),
+            "inspecting source traces",
+        ]
+        for phase in phases:
+            assert any(message.startswith(f"{phase}: started, ") for message in messages), phase
+            assert any(message.startswith(f"{phase}: done, ") for message in messages), phase
+        assert any(message.startswith("selected 27 source traces from 3 problems") for message in messages)
 
     def test_mixture_requires_every_positive_share_family(
         self,
@@ -1400,6 +1458,43 @@ class TestSourcePairing:
         else:
             assert not rows
             assert counts["skipped.banned_problem"] == 2
+
+
+class TestProgress:
+    def test_logs_counts_rate_remaining_time_and_details(
+        self,
+        exporter_logs: list[str],
+    ) -> None:
+        progress = exporter._Progress("fixture phase", 4, "items", lambda: "extra", interval_seconds=0)
+        progress.advance()
+        progress.advance(3)
+        progress.finish()
+        messages = exporter_logs
+        assert messages[0] == "fixture phase: started, 4 items"
+        assert messages[1].startswith("fixture phase: 1/4 items (25.0%), ")
+        assert "/s, about " in messages[1] and messages[1].endswith(" left; extra")
+        assert messages[2].startswith("fixture phase: 4/4 items (100.0%), ") and "about 0s left" in messages[2]
+        assert messages[3].startswith("fixture phase: done, 4 items in ") and messages[3].endswith("; extra")
+
+    def test_stays_quiet_within_the_interval(
+        self,
+        exporter_logs: list[str],
+    ) -> None:
+        progress = exporter._Progress("fixture phase", 2, "items", interval_seconds=3600)
+        progress.advance(2)
+        progress.finish()
+        assert [message.split(",")[0] for message in exporter_logs] == [
+            "fixture phase: started",
+            "fixture phase: done",
+        ]
+
+    @pytest.mark.parametrize(("seconds", "expected"), [(45.9, "45s"), (750, "12m30s"), (14820, "4h07m")])
+    def test_durations_are_compact(
+        self,
+        seconds: float,
+        expected: str,
+    ) -> None:
+        assert exporter._format_duration(seconds) == expected
 
 
 class TestRecipe:
